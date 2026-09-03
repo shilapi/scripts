@@ -10,21 +10,19 @@ Useful scripts, partly by AI
 
 ```bash
 sudo ./fetch-cert.sh \
-  --url '远端证书完整 URL' \
   --user 'HTTP Basic Auth 用户名' \
   --password 'HTTP Basic Auth 密码' \
-  --output '本机证书完整路径' \
+  --file '远端证书完整 URL' '本机证书完整路径' \
   --interval '3d'
 ```
 
 参数说明：
 
-- `--url`：远端证书的完整 URL。
+- `--file URL FILE`：远端证书的完整 URL 和本机完整路径；可重复传入，用于同时更新证书链、私钥等多个文件。
 - `--user`、`--password`：HTTP Basic Auth 账户和密码。
-- `--output`：本机的目标文件完整路径。
 - `--interval`：可选，更新周期，格式为正整数加 `d`。例如 `3d` 表示每 3 天、`5d` 表示每 5 天；默认 `7d`。
 
-首次配置会立即获取一次证书，随后安装 cron 任务。脚本会复制到 `/usr/local/bin/fetch-cert`，配置保存在仅 root 可读的 `/etc/fetch-cert.conf`，cron 此后从这份配置读取账户、密码、远端 URL 和目标路径。下载先写入目标文件同目录的临时文件，成功后再原子更新目标文件，避免写入半份内容。
+首次配置会立即获取所有文件，随后安装 cron 任务。脚本会复制到 `/usr/local/bin/fetch-cert`，配置保存在仅 root 可读的 `/etc/fetch-cert.conf`，cron 此后从这份配置读取账户、密码、远端 URL 和目标路径。每个文件先下载到目标目录的临时文件，成功后再原子更新，避免写入半份内容。只有所有文件都获取成功，才会记录本次更新周期。
 
 支持 Alpine Linux 与 Debian/Ubuntu；在 Debian/Ubuntu 中任务文件为 `/etc/cron.d/fetch-cert`，在 Alpine 中写入 root 的 `/etc/crontabs/root`。cron 每小时第 17 分钟运行一次检查，到达设定周期后才实际下载，因此时间误差最多约 1 小时。若系统未安装 curl 或 cron，首次配置时会自动安装。
 
@@ -32,10 +30,10 @@ sudo ./fetch-cert.sh \
 
 ```bash
 sudo ./fetch-cert.sh \
-  --url '远端证书完整 URL' \
   --user 'HTTP Basic Auth 用户名' \
   --password 'HTTP Basic Auth 密码' \
-  --output '本机证书完整路径' \
+  --file '远端证书完整 URL' '本机证书完整路径' \
+  --file '另一个远端文件 URL' '另一个本机完整路径' \
   --interval '5d'
 ```
 

@@ -25,15 +25,14 @@ die() {
 usage() {
   cat <<'EOF'
 用法：
-  fetch-cert.sh --url URL --user USER --password PASSWORD --output FILE [--interval Nd]
+  fetch-cert.sh --file URL FILE [--file URL FILE ...] --user USER --password PASSWORD [--interval Nd]
   fetch-cert.sh --sync
   fetch-cert.sh --uninstall
 
 首次配置或修改配置：
-  --url URL             远端证书完整 URL
+  --file URL FILE       远端证书完整 URL 和本机保存路径；可重复传入
   --user USER           HTTP Basic Auth 用户名
   --password PASSWORD   HTTP Basic Auth 密码
-  --output FILE         保存证书的本机完整路径
   --interval Nd         可选，更新间隔；例如 3d 为每 3 天，默认 7d
 
 维护命令：
@@ -83,10 +82,14 @@ validate_interval() {
 save_config() {
   umask 077
   {
-    printf 'CERT_URL=%q\n' "$URL"
+    printf 'CERT_URLS=('
+    printf ' %q' "${URLS[@]}"
+    printf ' )\n'
+    printf 'CERT_OUTPUTS=('
+    printf ' %q' "${OUTPUTS[@]}"
+    printf ' )\n'
     printf 'CERT_USER=%q\n' "$USER"
     printf 'CERT_PASSWORD=%q\n' "$PASSWORD"
-    printf 'CERT_OUTPUT=%q\n' "$OUTPUT"
     printf 'CERT_INTERVAL=%q\n' "$INTERVAL"
   } > "$CONFIG_PATH"
   chmod 600 "$CONFIG_PATH"
@@ -94,17 +97,19 @@ save_config() {
 }
 
 load_config() {
-  [[ -r "$CONFIG_PATH" ]] || die "尚未配置，请先传入 --url、--user、--password 和 --output"
+  [[ -r "$CONFIG_PATH" ]] || die "尚未配置，请先传入 --file、--user 和 --password"
   # 配置仅由本脚本写入，权限为 root:root 600。
   # shellcheck disable=SC1090
   source "$CONFIG_PATH"
-  [[ -n ${CERT_URL:-} && -n ${CERT_USER:-} && -n ${CERT_PASSWORD:-} && -n ${CERT_OUTPUT:-} && -n ${CERT_INTERVAL:-} ]] \
+  declare -p CERT_URLS CERT_OUTPUTS >/dev/null 2>&1 \
+    || die "配置文件不完整: $CONFIG_PATH"
+  [[ ${#CERT_URLS[@]} -gt 0 && ${#CERT_URLS[@]} -eq ${#CERT_OUTPUTS[@]} && -n ${CERT_USER:-} && -n ${CERT_PASSWORD:-} && -n ${CERT_INTERVAL:-} ]] \
     || die "配置文件不完整: $CONFIG_PATH"
   validate_interval "$CERT_INTERVAL"
 }
 
 sync_certificate() {
-  local force=${1:-0} output_dir output_name temp_file interval_days interval_seconds now last_success
+  local force=${1:-0} output_dir output_name temp_file interval_days interval_seconds now last_success index failed=0
   load_config
   command -v curl >/dev/null 2>&1 || die '缺少 curl'
 
@@ -119,26 +124,31 @@ sync_certificate() {
     fi
   fi
 
-  output_dir=$(dirname -- "$CERT_OUTPUT")
-  output_name=$(basename -- "$CERT_OUTPUT")
-  mkdir -p -- "$output_dir"
-  temp_file=$(mktemp "${output_dir}/.${output_name}.tmp.XXXXXX") \
-    || die '无法创建临时文件'
+  for index in "${!CERT_URLS[@]}"; do
+    output_dir=$(dirname -- "${CERT_OUTPUTS[index]}")
+    output_name=$(basename -- "${CERT_OUTPUTS[index]}")
+    mkdir -p -- "$output_dir"
+    temp_file=$(mktemp "${output_dir}/.${output_name}.tmp.XXXXXX") \
+      || die '无法创建临时文件'
 
-  # 不解析或校验证书内容；只在下载成功后以原子方式更新目标文件。
-  if curl --fail --location --silent --show-error \
-      --user "${CERT_USER}:${CERT_PASSWORD}" \
-      --output "$temp_file" \
-      "$CERT_URL"; then
-    mv -f -- "$temp_file" "$CERT_OUTPUT"
-    mkdir -p "$STATE_DIR"
-    printf '%s\n' "$now" > "$STATE_PATH"
-    chmod 600 "$STATE_PATH"
-    say "已更新：$CERT_OUTPUT"
-  else
-    rm -f -- "$temp_file"
-    die '获取证书失败'
-  fi
+    # 不解析或校验证书内容；只在下载成功后以原子方式更新目标文件。
+    if curl --fail --location --silent --show-error \
+        --user "${CERT_USER}:${CERT_PASSWORD}" \
+        --output "$temp_file" \
+        "${CERT_URLS[index]}"; then
+      mv -f -- "$temp_file" "${CERT_OUTPUTS[index]}"
+      say "已更新：${CERT_OUTPUTS[index]}"
+    else
+      rm -f -- "$temp_file"
+      say "ERROR: 获取失败：${CERT_OUTPUTS[index]}" >&2
+      failed=1
+    fi
+  done
+
+  [[ $failed -eq 0 ]] || return 1
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$now" > "$STATE_PATH"
+  chmod 600 "$STATE_PATH"
 }
 
 install_program() {
@@ -190,7 +200,7 @@ setup() {
   install_dependencies
   save_config
   install_program
-  sync_certificate 1
+  sync_certificate 1 || die '首次获取失败，未安装 cron 任务'
   install_cron
   start_cron
   say "定时任务已安装: $CRONTAB_PATH（每小时检查，到 $INTERVAL 后更新）"
@@ -209,19 +219,23 @@ uninstall() {
   say '已删除本脚本的 cron 任务、配置、日志和程序副本'
 }
 
-URL=''
 USER=''
 PASSWORD=''
-OUTPUT=''
+URLS=()
+OUTPUTS=()
 INTERVAL='7d'
 ACTION='setup'
 
 while (($#)); do
   case "$1" in
-    --url) URL=${2-}; shift 2 ;;
+    --file)
+      [[ $# -ge 3 ]] || die '--file 需要 URL 和本机路径两个参数'
+      URLS+=("$2")
+      OUTPUTS+=("$3")
+      shift 3
+      ;;
     --user) USER=${2-}; shift 2 ;;
     --password) PASSWORD=${2-}; shift 2 ;;
-    --output) OUTPUT=${2-}; shift 2 ;;
     --interval) INTERVAL=${2-}; shift 2 ;;
     --sync) ACTION='sync'; shift ;;
     --uninstall) ACTION='uninstall'; shift ;;
@@ -232,7 +246,7 @@ done
 
 case "$ACTION" in
   setup)
-    [[ -n "$URL" && -n "$USER" && -n "$PASSWORD" && -n "$OUTPUT" ]] \
+    [[ ${#URLS[@]} -gt 0 && -n "$USER" && -n "$PASSWORD" ]] \
       || { usage >&2; exit 2; }
     validate_interval "$INTERVAL"
     setup
