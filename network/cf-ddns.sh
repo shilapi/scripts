@@ -5,11 +5,12 @@ PROGRAM='cf-ddns'
 INSTALL_PATH='/usr/local/bin/cf-ddns'
 CONFIG_PATH='/etc/cf-ddns.conf'
 RECORDS_PATH='/etc/cf-ddns.records'
-CRONTAB_PATH='/etc/crontabs/root'
 LOG_PATH='/var/log/cf-ddns.log'
 CRON_MARKER='# cf-ddns-managed'
 API_BASE='https://api.cloudflare.com/client/v4'
 IP_URL='https://cloudflare.com/cdn-cgi/trace'
+PLATFORM=''
+CRONTAB_PATH=''
 
 say() {
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
@@ -22,6 +23,22 @@ die() {
 
 need_root() {
     [ "$(id -u)" -eq 0 ] || die '请使用 root 运行'
+}
+
+detect_platform() {
+    if command -v apk >/dev/null 2>&1; then
+        PLATFORM='alpine'
+        CRONTAB_PATH='/etc/crontabs/root'
+    elif command -v apt-get >/dev/null 2>&1; then
+        PLATFORM='debian'
+        CRONTAB_PATH='/etc/cron.d/cf-ddns'
+    else
+        die '仅支持 Alpine Linux（apk）和 Debian/Ubuntu（apt-get）'
+    fi
+}
+
+cron_is_running() {
+    pidof cron >/dev/null 2>&1 || pidof crond >/dev/null 2>&1
 }
 
 valid_dns_name() {
@@ -77,6 +94,8 @@ save_config() {
         printf 'CF_API_TOKEN=%s\n' "$CF_API_TOKEN"
     } > "$CONFIG_PATH"
     chmod 600 "$CONFIG_PATH"
+    say "配置已保存至: $CONFIG_PATH"
+    say "DDNS 记录清单位置: $RECORDS_PATH"
 }
 
 record_name() {
@@ -195,27 +214,88 @@ sync_dns_record() {
     esac
 }
 
+parse_record_spec() {
+    record_spec=$1
+    dns_type=${record_spec%%|*}
+    record=${record_spec#*|}
+    [ "$dns_type" != "$record_spec" ] || die "DDNS 记录格式无效: $record_spec"
+    case "$dns_type" in
+        A|AAAA) ;;
+        *) die "DDNS 记录类型无效: $dns_type" ;;
+    esac
+    [ -n "$record" ] || die 'DDNS 记录名不能为空'
+    valid_dns_name "$record" || die "DDNS 记录名无效: $record"
+    case "$record" in
+        "$CF_ZONE"|*."$CF_ZONE") ;;
+        *) die "$record 不属于主域名 $CF_ZONE" ;;
+    esac
+}
+
+migrate_records_file() {
+    [ -s "$RECORDS_PATH" ] || return 0
+    needs_migration=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        case "$line" in
+            A\|*|AAAA\|*) ;;
+            *) needs_migration=1; break ;;
+        esac
+    done < "$RECORDS_PATH"
+    [ "$needs_migration" -eq 1 ] || return 0
+
+    temp_records="$RECORDS_PATH.new.$$"
+    umask 077
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        case "$line" in
+            A\|*|AAAA\|*)
+                printf '%s\n' "$line" >> "$temp_records"
+                ;;
+            *)
+                # 旧版每个域名都同步 A 与 AAAA；迁移时保留此行为。
+                legacy_record=$(record_name "$line")
+                printf 'A|%s\nAAAA|%s\n' "$legacy_record" "$legacy_record" >> "$temp_records"
+                ;;
+        esac
+    done < "$RECORDS_PATH"
+    chmod 600 "$temp_records"
+    mv "$temp_records" "$RECORDS_PATH"
+    say "已升级 DDNS 记录清单格式: $RECORDS_PATH"
+}
+
 sync_records() {
     load_config
     [ "$#" -gt 0 ] || return 0
     ipv4=''
     ipv6=''
+    need_ipv4=0
+    need_ipv6=0
     failed=0
 
-    if ! ipv4=$(public_ip 4); then
+    for record_spec in "$@"; do
+        parse_record_spec "$record_spec"
+        case "$dns_type" in
+            A) need_ipv4=1 ;;
+            AAAA) need_ipv6=1 ;;
+        esac
+    done
+    if [ "$need_ipv4" -eq 1 ] && ! ipv4=$(public_ip 4); then
         say 'ERROR: 无法通过 IPv4 查询公网地址' >&2
         failed=1
     fi
-    if ! ipv6=$(public_ip 6); then
+    if [ "$need_ipv6" -eq 1 ] && ! ipv6=$(public_ip 6); then
         say 'ERROR: 无法通过 IPv6 查询公网地址；请确认服务器具有公网 IPv6' >&2
         failed=1
     fi
-    [ -n "$ipv4$ipv6" ] || die 'IPv4 和 IPv6 均不可用'
+    [ -n "$ipv4$ipv6" ] || die '所选的 IPv4/IPv6 均不可用'
     zone=$(zone_id)
 
-    for record in "$@"; do
-        [ -z "$ipv4" ] || sync_dns_record "$zone" "$record" A "$ipv4"
-        [ -z "$ipv6" ] || sync_dns_record "$zone" "$record" AAAA "$ipv6"
+    for record_spec in "$@"; do
+        parse_record_spec "$record_spec"
+        case "$dns_type" in
+            A) [ -z "$ipv4" ] || sync_dns_record "$zone" "$record" A "$ipv4" ;;
+            AAAA) [ -z "$ipv6" ] || sync_dns_record "$zone" "$record" AAAA "$ipv6" ;;
+        esac
     done
     [ "$failed" -eq 0 ]
 }
@@ -226,48 +306,82 @@ sync_all() {
     command -v jq >/dev/null 2>&1 || die '缺少 jq'
     load_config
     [ -s "$RECORDS_PATH" ] || { say '没有已配置的 DDNS'; return 0; }
+    migrate_records_file
 
-    # 记录名已在添加时严格校验，不含空格。
+    # 记录规格已在添加时严格校验，不含空格。
     # shellcheck disable=SC2046
     sync_records $(sed '/^[[:space:]]*$/d' "$RECORDS_PATH")
 }
 
 install_dependencies() {
-    command -v apk >/dev/null 2>&1 || die '此脚本面向 Alpine Linux（未找到 apk）'
-    apk add --no-cache curl jq ca-certificates
+    detect_platform
+    case "$PLATFORM" in
+        alpine)
+            apk add --no-cache curl jq ca-certificates
+            ;;
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends curl jq ca-certificates cron
+            ;;
+    esac
 }
 
 install_program() {
     install_dependencies
-    mkdir -p /usr/local/bin /etc/crontabs
+    if [ "$PLATFORM" = 'alpine' ]; then
+        mkdir -p /usr/local/bin /etc/crontabs
+    else
+        mkdir -p /usr/local/bin /etc/cron.d
+    fi
     temp_path="$INSTALL_PATH.new.$$"
     cp "$0" "$temp_path"
     chmod 700 "$temp_path"
     mv "$temp_path" "$INSTALL_PATH"
-    touch "$RECORDS_PATH" "$CRONTAB_PATH"
-    chmod 600 "$RECORDS_PATH" "$CRONTAB_PATH"
+    touch "$RECORDS_PATH" "$LOG_PATH"
+    chmod 600 "$RECORDS_PATH" "$LOG_PATH"
+    migrate_records_file
 
-    sed -i "\|$CRON_MARKER$|d" "$CRONTAB_PATH"
-    printf '17 2 * * * %s --sync-all >>%s 2>&1 %s\n' \
-        "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$CRONTAB_PATH"
+    if [ "$PLATFORM" = 'alpine' ]; then
+        touch "$CRONTAB_PATH"
+        chmod 600 "$CRONTAB_PATH"
+        sed -i "\|$CRON_MARKER$|d" "$CRONTAB_PATH"
+        printf '17 2 * * * %s --sync-all >>%s 2>&1 %s\n' \
+            "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER" >> "$CRONTAB_PATH"
+    else
+        temp_cron="$CRONTAB_PATH.new.$$"
+        {
+            printf '%s\n' 'SHELL=/bin/sh'
+            printf '17 2 * * * root %s --sync-all >>%s 2>&1 %s\n' \
+                "$INSTALL_PATH" "$LOG_PATH" "$CRON_MARKER"
+        } > "$temp_cron"
+        chmod 644 "$temp_cron"
+        mv "$temp_cron" "$CRONTAB_PATH"
+    fi
 
-    if command -v rc-update >/dev/null 2>&1; then
+    if [ "$PLATFORM" = 'alpine' ]; then
         rc-update add crond default >/dev/null 2>&1 || true
         rc-service crond restart >/dev/null 2>&1 \
             || rc-service crond start >/dev/null 2>&1 \
             || true
-    elif ! pidof crond >/dev/null 2>&1; then
-        crond
+    else
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable --now cron >/dev/null 2>&1 || true
+        fi
+        if ! cron_is_running; then
+            service cron start >/dev/null 2>&1 || true
+        fi
     fi
+    say "定时任务已安装: $CRONTAB_PATH（每日 02:17 同步）"
 }
 
 service_status() {
     if [ -x "$INSTALL_PATH" ] \
         && grep -Fq "$CRON_MARKER" "$CRONTAB_PATH" 2>/dev/null; then
-        if pidof crond >/dev/null 2>&1; then
-            printf '已安装 / 运行中'
+        if cron_is_running; then
+            printf '已安装 / 定时服务运行中'
         else
-            printf '已安装 / crond 未运行'
+            printf '已安装 / 定时服务未运行'
         fi
     else
         printf '未安装'
@@ -284,7 +398,11 @@ record_count() {
 
 show_records() {
     if [ -s "$RECORDS_PATH" ]; then
-        awk 'NF { printf "  %d) %s\n", ++n, $0 }' "$RECORDS_PATH"
+        awk -F'|' '
+            $1 == "A" { printf "  %d) IPv4 (A)    %s\n", ++n, $2; next }
+            $1 == "AAAA" { printf "  %d) IPv6 (AAAA) %s\n", ++n, $2; next }
+            NF { printf "  %d) 未知格式   %s\n", ++n, $0 }
+        ' "$RECORDS_PATH"
     else
         printf '  （无）\n'
     fi
@@ -296,16 +414,32 @@ add_ddns() {
     [ -n "$subdomain" ] || die '子域名不能为空'
     record=$(record_name "$subdomain")
 
-    install_program
-    if grep -Fxq "$record" "$RECORDS_PATH"; then
-        say "$record 已存在，立即重新同步"
-    else
-        printf '%s\n' "$record" >> "$RECORDS_PATH"
-        say "已添加 DDNS: $record"
-    fi
+    printf '请选择要同步的地址类型 [1=仅 IPv4，2=仅 IPv6，3=IPv4 + IPv6]: '
+    IFS= read -r address_choice
+    case "$address_choice" in
+        1) types='A' ;;
+        2) types='AAAA' ;;
+        3) types='A AAAA' ;;
+        *) die '地址类型无效' ;;
+    esac
 
-    if sync_records "$record"; then
-        say 'IPv4 与 IPv6 同步完成'
+    install_program
+    sync_specs=''
+    for dns_type in $types; do
+        record_spec="$dns_type|$record"
+        if grep -Fxq "$record_spec" "$RECORDS_PATH"; then
+            say "$record_spec 已存在，立即重新同步"
+        else
+            printf '%s\n' "$record_spec" >> "$RECORDS_PATH"
+            say "已添加 DDNS: $record_spec"
+        fi
+        sync_specs="$sync_specs $record_spec"
+    done
+
+    # 记录规格不含空格。
+    # shellcheck disable=SC2086
+    if sync_records $sync_specs; then
+        say '所选地址类型同步完成'
     else
         say '部分地址同步失败，定时任务稍后会重试' >&2
     fi
@@ -332,6 +466,7 @@ delete_remote_type() {
 delete_ddns() {
     load_config
     [ -s "$RECORDS_PATH" ] || { say '没有可删除的 DDNS'; return 0; }
+    migrate_records_file
     printf '\n当前 DDNS：\n'
     show_records
     printf '请选择要删除的编号: '
@@ -339,9 +474,10 @@ delete_ddns() {
     case "$selection" in
         ''|*[!0-9]*) die '编号无效' ;;
     esac
-    record=$(sed -n "${selection}p" "$RECORDS_PATH")
-    [ -n "$record" ] || die '编号不存在'
-    printf '将删除本地任务以及 Cloudflare 的 A/AAAA：%s，确认？[y/N]: ' "$record"
+    record_spec=$(sed -n "${selection}p" "$RECORDS_PATH")
+    [ -n "$record_spec" ] || die '编号不存在'
+    parse_record_spec "$record_spec"
+    printf '将删除本地任务以及 Cloudflare 的 %s：%s，确认？[y/N]: ' "$dns_type" "$record"
     IFS= read -r confirm
     case "$confirm" in
         y|Y|yes|YES) ;;
@@ -349,13 +485,12 @@ delete_ddns() {
     esac
 
     zone=$(zone_id)
-    delete_remote_type "$zone" "$record" A
-    delete_remote_type "$zone" "$record" AAAA
+    delete_remote_type "$zone" "$record" "$dns_type"
     temp_records="$RECORDS_PATH.new.$$"
-    grep -Fxv "$record" "$RECORDS_PATH" > "$temp_records" || true
+    grep -Fxv "$record_spec" "$RECORDS_PATH" > "$temp_records" || true
     chmod 600 "$temp_records"
     mv "$temp_records" "$RECORDS_PATH"
-    say "已删除 DDNS: $record"
+    say "已删除 DDNS: $record_spec"
 }
 
 uninstall_service() {
@@ -366,7 +501,9 @@ uninstall_service() {
         *) say '已取消'; return 0 ;;
     esac
 
-    if [ -f "$CRONTAB_PATH" ]; then
+    if [ "$PLATFORM" = 'debian' ]; then
+        rm -f "$CRONTAB_PATH"
+    elif [ -f "$CRONTAB_PATH" ]; then
         sed -i "\|$CRON_MARKER$|d" "$CRONTAB_PATH"
     fi
     rm -f "$CONFIG_PATH" "$RECORDS_PATH" "$LOG_PATH" "$INSTALL_PATH"
@@ -382,10 +519,12 @@ show_panel() {
         printf '+--------------------------------------------------+\n'
         printf '| 主域名: %-39s |\n' "$CF_ZONE"
         printf '| 服务状态: %-37s |\n' "$(service_status)"
-        printf '| DDNS 数量: %-37s |\n' "$(record_count)"
+        printf '| DDNS 记录数: %-35s |\n' "$(record_count)"
+        printf '| 配置文件: %-36s |\n' "$CONFIG_PATH"
+        printf '| 记录清单: %-36s |\n' "$RECORDS_PATH"
         printf '+--------------------------------------------------+\n'
-        printf '  1) 添加 DDNS（自动创建/更新 A + AAAA）\n'
-        printf '  2) 删除 DDNS（同时删除 Cloudflare A + AAAA）\n'
+        printf '  1) 添加 DDNS（可分别选择 IPv4 / IPv6）\n'
+        printf '  2) 删除 DDNS（仅删除所选 IPv4 或 IPv6 记录）\n'
         printf '  3) 删除本机 DDNS 服务（保留 Cloudflare 记录）\n'
         printf '  4) 查看 DDNS 列表\n'
         printf '  0) 退出\n'
@@ -410,8 +549,11 @@ usage() {
   $0                         # 已配置后直接打开管理面板
 
 Token 需要 Zone:Read 和 DNS:Edit 权限。
+支持 Alpine Linux 与 Debian/Ubuntu。配置会保存至 $CONFIG_PATH。
 EOF
 }
+
+detect_platform
 
 if [ "${1:-}" = '--sync-all' ]; then
     sync_all
