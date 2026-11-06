@@ -41,6 +41,18 @@ sudo ./fetch-cert.sh \
 
 ## network
 
+### port-forward
+
+Linux IPv4 TCP/UDP 端口转发管理脚本，支持 Alpine Linux 与 Debian/Ubuntu。直接执行下面的一键命令会安装依赖、安装每日定时任务并打开交互菜单：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shilapi/scripts/main/network/port-forward.sh | sudo bash
+```
+
+菜单提供四项主要操作：打开、关闭、新增、修改端口转发。新增规则时可填写单端口或等长端口范围，并将流量转发到 IPv4 地址或域名；本机端口与对端端口可以不同。脚本每天 04:17 重新解析域名，仅在本机保存最新 IPv4，并重建它自己管理的 `iptables` 规则；系统启动时也会恢复已打开的规则。
+
+所有转发地址、域名和端口都只在运行时输入，并保存在本机 root 专用的 `/etc/port-forward/rules.tsv`（权限 `600`）中，GitHub 脚本不包含这些信息。关闭功能只移除本脚本的独立规则链并保留配置，也不会擅自关闭可能被其他服务使用的系统 IP 转发。
+
 ### cf-ddns
 
 Cloudflare DDNS script for Alpine Linux and Debian/Ubuntu. It can maintain IPv4
