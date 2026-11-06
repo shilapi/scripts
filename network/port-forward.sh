@@ -54,10 +54,10 @@ open_input() {
 }
 
 prompt() {
-    local message=$1 variable=$2 value
+    local message=$1 variable=$2 input_value
     printf '%s' "$message" >/dev/tty 2>/dev/null || printf '%s' "$message"
-    IFS= read -r -u "$INPUT_FD" value || die '无法读取输入'
-    printf -v "$variable" '%s' "$value"
+    IFS= read -r -u "$INPUT_FD" input_value || die '无法读取输入'
+    printf -v "$variable" '%s' "$input_value"
 }
 
 valid_ipv4() {
