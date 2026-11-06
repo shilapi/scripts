@@ -140,14 +140,26 @@ is_enabled() {
 }
 
 install_dependencies() {
+    local packages=()
     case "$PLATFORM" in
         alpine)
-            apk add --no-cache bash iptables musl-utils curl ca-certificates
+            command -v iptables >/dev/null 2>&1 || packages+=(iptables)
+            command -v getent >/dev/null 2>&1 || packages+=(musl-utils)
+            command -v curl >/dev/null 2>&1 || packages+=(curl)
+            [[ -r /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
+            ((${#packages[@]} == 0)) || apk add --no-cache "${packages[@]}"
             ;;
         debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y --no-install-recommends bash iptables cron curl ca-certificates
+            command -v iptables >/dev/null 2>&1 || packages+=(iptables)
+            command -v getent >/dev/null 2>&1 || packages+=(libc-bin)
+            command -v curl >/dev/null 2>&1 || packages+=(curl)
+            command -v cron >/dev/null 2>&1 || packages+=(cron)
+            [[ -r /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
+            if ((${#packages[@]} > 0)); then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y --no-install-recommends "${packages[@]}"
+            fi
             ;;
     esac
 }
